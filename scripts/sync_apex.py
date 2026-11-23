@@ -4,10 +4,11 @@ import os
 import re
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from playwright.sync_api import sync_playwright
 
 # ================= CONFIGURACIÓN =================
 APEX_BASE_URL = "https://g7291f4e4aa4c82-agentech.adb.sa-saopaulo-1.oraclecloudapps.com/ords/"
@@ -18,17 +19,17 @@ APEX_PASS = os.environ.get("APEX_PASS", "")
 
 GEO_JS_PATH = Path("layers/COMBINADO_3.js")
 CSV_OUT_PATH = Path("layers/PPI_TABLA.csv")
+INDEX_HTML_PATH = Path("index.html")
 COMMIT_MSG_PATH = Path(".commit_msg.txt")
 DEBUG_IMG_PATH = Path("debug_apex.png")
 
-# Por ahora vacío para usar los estados TAL CUAL vienen del sistema.
-# Luego puedes llenar equivalencias aquí, ej: {"LIBRE": "Libre", "VENDIDO": "Vendido", "P": "Cancelado"}
+# Vacío para usar los estados TAL CUAL vienen del sistema.
+# Luego puedes definir equivalencias aquí, ej: {"LIBRE": "Libre", "VENDIDO": "Vendido"}
 MAPA_ESTADOS = {}
 
 # Fracción 3 en APEX usa Manzanas 1..4 pero en COMBINADO_3.js usa A..D
 MAPA_MANZANA_FRAC3 = {"1": "A", "2": "B", "3": "C", "4": "D"}
 
-# Descuento por defecto si un polígono nuevo no tiene el campo "Descuento"
 DESCUENTO_DEFAULT = 0.50
 CUOTAS_TOTAL = 130
 # =================================================
@@ -40,14 +41,16 @@ def descargar_csv_apex(destino_csv: Path) -> Path:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(accept_downloads=True, viewport={"width": 1600, "height": 900})
+        context = browser.new_context(
+            accept_downloads=True,
+            viewport={"width": 1600, "height": 900},
+        )
         page = context.new_page()
 
         try:
             print("1) Abriendo Oracle APEX...")
             page.goto(APEX_LOGIN_URL, wait_until="networkidle", timeout=60000)
 
-            # Login en Oracle APEX
             user_input = page.locator(
                 'input[name="P9999_USERNAME"], input[name="P101_USERNAME"], input[type="text"]'
             ).first
@@ -60,11 +63,9 @@ def descargar_csv_apex(destino_csv: Path) -> Path:
             pass_input.fill(APEX_PASS)
             pass_input.press("Enter")
 
-            # Esperar a entrar al sistema
             page.wait_for_load_state("networkidle", timeout=60000)
             page.wait_for_timeout(3000)
 
-            # Si APEX redirigió al Home (página 1) en vez de la 553 (Lotes), saltar directo conservando la sesión
             url_actual = page.url
             print(f"2) Sesión iniciada. URL actual: {url_actual}")
             m_sess = re.search(r"f\?p=152:(\d+):(\d+)", url_actual)
@@ -76,44 +77,58 @@ def descargar_csv_apex(destino_csv: Path) -> Path:
                 page.goto(url_lotes, wait_until="networkidle", timeout=60000)
                 page.wait_for_timeout(2000)
 
-            # Verificar que estamos en la grilla de Lotes
-            btn_acciones = page.locator('button:has-text("Acciones")').first
+            print("3) Abriendo menú Acciones -> Descargar...")
+            btn_acciones = page.locator(
+                'button[id$="_actions_button"]:visible, button:has-text("Acciones"):visible'
+            ).first
             btn_acciones.wait_for(state="visible", timeout=30000)
-
-            print("3) Descargando CSV desde Acciones -> Descargar...")
-            # Intento 1: Descarga directa vía URL estándar de Oracle APEX Interactive Report (más rápida)
-            if session_id:
-                try:
-                    with page.expect_download(timeout=20000) as download_info:
-                        page.goto(f"{APEX_BASE_URL}f?p=152:553:{session_id}:CSV::::")
-                    download = download_info.value
-                    download.save_as(str(destino_csv))
-                    print(f"   CSV descargado vía URL directa: {destino_csv}")
-                    return destino_csv
-                except Exception:
-                    # Volver a la página 553 y usar los clics de la interfaz
-                    page.goto(f"{APEX_BASE_URL}f?p=152:553:{session_id}:::::", wait_until="networkidle")
-                    btn_acciones.wait_for(state="visible", timeout=30000)
-
-            # Intento 2: Clic en Acciones -> Descargar -> CSV
             btn_acciones.click()
-            page.locator('button:has-text("Descargar"), a:has-text("Descargar"), span:has-text("Descargar")').first.click()
-            page.wait_for_timeout(1500)
 
+            # Esperar al menú desplegable visible de APEX (.a-Menu)
+            menu_visible = page.locator(".a-Menu:visible").first
+            menu_visible.wait_for(state="visible", timeout=15000)
+
+            item_descargar = menu_visible.locator(
+                'button:has-text("Descargar"), a:has-text("Descargar"), span.a-Menu-label:has-text("Descargar")'
+            ).first
+            item_descargar.wait_for(state="visible", timeout=15000)
+            item_descargar.click()
+
+            # Esperar a que se abra el diálogo modal de descarga
+            dialogo = page.locator(".ui-dialog:visible").first
+            dialogo.wait_for(state="visible", timeout=20000)
+            page.wait_for_timeout(1000)
+
+            print("4) Seleccionando formato CSV en el diálogo...")
             with page.expect_download(timeout=60000) as download_info:
-                # En APEX 24/26 puede ser un botón/tile CSV directo o seleccionar CSV + botón Descargar
-                csv_opt = page.locator(
-                    'a[id$="_download_CSV"], button:has-text("CSV"), li[data-format="CSV"], label:has-text("CSV")'
+                csv_opt = dialogo.locator(
+                    'a[id$="_download_CSV"]:visible, '
+                    'li[data-format="CSV"]:visible, '
+                    'button[data-format="CSV"]:visible, '
+                    'button:has-text("CSV"):visible, '
+                    'a:has-text("CSV"):visible, '
+                    'label:has-text("CSV"):visible, '
+                    'span:has-text("CSV"):visible'
                 ).first
+                csv_opt.wait_for(state="visible", timeout=15000)
                 csv_opt.click()
-                # Si el modal tiene un botón de confirmación "Descargar"
-                modal_btn = page.locator('.ui-dialog button:has-text("Descargar")')
-                if modal_btn.count() > 0 and modal_btn.first.is_visible():
-                    modal_btn.first.click()
+
+                # Si APEX usa botón de confirmación "Descargar" dentro del modal, hacer clic
+                page.wait_for_timeout(1000)
+                try:
+                    confirm_btn = dialogo.locator(
+                        '.ui-dialog-buttonpane button:has-text("Descargar"):visible, '
+                        'button.js-confirmBtn:visible'
+                    ).first
+                    if confirm_btn.is_visible():
+                        confirm_btn.click()
+                except Exception:
+                    # El modal ya se cerró porque la descarga inició al hacer clic en CSV
+                    pass
 
             download = download_info.value
             download.save_as(str(destino_csv))
-            print(f"   CSV descargado vía interfaz: {destino_csv}")
+            print(f"   CSV descargado correctamente: {destino_csv} ({destino_csv.stat().st_size} bytes)")
             return destino_csv
 
         except Exception as e:
@@ -128,7 +143,6 @@ def limpiar_entero(valor: str) -> int:
     s = str(valor or "").strip()
     if not s or s.lower() == "nan":
         return 0
-    # Quitar puntos de miles y decimales si hubiera
     s = s.split(",")[0]
     digits = re.sub(r"[^\d]", "", s)
     return int(digits) if digits else 0
@@ -144,9 +158,7 @@ def limpiar_superficie(valor: str) -> str:
     s = str(valor or "").strip()
     if not s or s.lower() == "nan":
         return ""
-    # "4.825,95" -> "4825.95" | "734,25" -> "734.25"
-    s = s.replace(".", "").replace(",", ".")
-    return s
+    return s.replace(".", "").replace(",", ".")
 
 
 def parsear_descuento(desc_str: str) -> float:
@@ -176,12 +188,16 @@ def construir_id(fraccion: str, manzana: str, lote: str) -> str:
 
 def cargar_datos_apex(csv_path: Path) -> dict:
     try:
-        df = pd.read_csv(csv_path, sep=";", encoding="utf-8", dtype=str).fillna("")
+        df = pd.read_csv(csv_path, sep=";", encoding="utf-8-sig", dtype=str).fillna("")
     except UnicodeDecodeError:
         df = pd.read_csv(csv_path, sep=";", encoding="latin1", dtype=str).fillna("")
 
-    df["ID_CALC"] = df.apply(lambda r: construir_id(r["Fraccion"], r["Manzana"], r["Lote"]), axis=1)
-    # Conservar la última fila en caso de duplicados en APEX
+    # Limpiar espacios en nombres de columnas por seguridad
+    df.columns = [c.strip() for c in df.columns]
+
+    df["ID_CALC"] = df.apply(
+        lambda r: construir_id(r["Fraccion"], r["Manzana"], r["Lote"]), axis=1
+    )
     df = df.drop_duplicates(subset=["ID_CALC"], keep="last")
 
     registros = {}
@@ -205,7 +221,9 @@ def actualizar_archivos(datos_apex: dict) -> list:
     geo = json.loads(json_body)
 
     cambios = []
-    filas_csv = [["ID", "Manzana", "Lote", "Superficie", "Estado", "Cuota", "Total", "Descuento", "Contado"]]
+    filas_csv = [
+        ["ID", "Manzana", "Lote", "Superficie", "Estado", "Cuota", "Total", "Descuento", "Contado"]
+    ]
 
     for feat in geo["features"]:
         props = feat["properties"]
@@ -266,22 +284,32 @@ def actualizar_archivos(datos_apex: dict) -> list:
         ])
 
     if cambios:
-        # Guardar COMBINADO_3.js actualizado
         GEO_JS_PATH.write_text(
             prefix + json.dumps(geo, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        # Guardar layers/PPI_TABLA.csv sincronizado
+
         CSV_OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CSV_OUT_PATH.open("w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
             writer.writerows(filas_csv)
 
+        # Actualizar versión en index.html para evitar caché en navegadores móviles
+        if INDEX_HTML_PATH.exists():
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
+            html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+            html_nuevo = re.sub(
+                r'layers/COMBINADO_3\.js(\?v=\d+)?',
+                f'layers/COMBINADO_3.js?v={stamp}',
+                html,
+            )
+            INDEX_HTML_PATH.write_text(html_nuevo, encoding="utf-8")
+
     return cambios
 
 
 def main():
-    # Permite probar localmente pasando un CSV: python scripts/sync_apex.py Lotes.csv
+    # Permite prueba local pasando un CSV: python scripts/sync_apex.py Lotes.csv
     if len(sys.argv) > 1 and Path(sys.argv[1]).exists():
         csv_path = Path(sys.argv[1])
         print(f"Modo prueba local con archivo: {csv_path}")
@@ -310,7 +338,10 @@ def main():
     resumen = ", ".join(cambios[:5])
     if len(cambios) > 5:
         resumen += f" (+{len(cambios) - 5} más)"
-    COMMIT_MSG_PATH.write_text(f"Sync APEX ({len(cambios)} cambios): {resumen}\n", encoding="utf-8")
+    COMMIT_MSG_PATH.write_text(
+        f"Sync APEX ({len(cambios)} cambios): {resumen}\n",
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":
