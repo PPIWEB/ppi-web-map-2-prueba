@@ -1,0 +1,60 @@
+name: Sincronizar Lotes desde Oracle APEX
+
+on:
+  schedule:
+    # Cada 15 min, de 07:00 a 19:59 hora Paraguay (10:00 a 22:59 UTC), Lunes a Sábado
+    - cron: '*/15 10-22 * * 1-6'
+  workflow_dispatch: # Permite ejecutar manualmente cuando quieras probar
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias y navegador Playwright
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Ejecutar sincronización con APEX
+        env:
+          APEX_USER: ${{ secrets.APEX_USER }}
+          APEX_PASS: ${{ secrets.APEX_PASS }}
+        run: python scripts/sync_apex.py
+
+      - name: Subir captura de error si falló APEX
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apex-screenshot
+          path: debug_apex.png
+          if-no-files-found: ignore
+
+      - name: Hacer commit y push solo si hubo cambios
+        run: |
+          if [ -f .commit_msg.txt ]; then
+            MSG=$(cat .commit_msg.txt)
+            rm -f .commit_msg.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add layers/COMBINADO_3.js layers/PPI_TABLA.csv
+            if ! git diff --cached --quiet; then
+              git commit -m "$MSG"
+              git push
+            else
+              echo "No hay diferencias reales en git."
+            fi
+          else
+            echo "Sin cambios que publicar."
+          fi
